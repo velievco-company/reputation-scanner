@@ -122,10 +122,19 @@ def run_analysis(company_name: str, website: str, location: str) -> dict:
 
     negative_findings = []
     for item in negative_search.get("data", []):
+        # NewsAPI даёт точную дату публикации -> используем её для recency decay.
+        # DuckDuckGo/Brave не всегда дают точную дату в сниппете -> используем
+        # консервативную оценку 180 дней (среднее между "только что" и "давно").
+        published_at = item.get("published_at", "")
+        if published_at:
+            days_ago = search_engine.newsapi_days_ago(published_at)
+        else:
+            days_ago = 180
+
         negative_findings.append({
             "title": item.get("title", ""),
             "url": item.get("url", ""),
-            "days_ago": 180,  # DuckDuckGo/Brave не всегда дают точную дату в сниппете
+            "days_ago": days_ago,
             "severity": "medium",
         })
 
@@ -185,8 +194,9 @@ with st.expander("ℹ️ Как это работает"):
 
 groq_available = ai_analyzer._get_groq_client() is not None
 brave_available = search_engine._get_secret("BRAVE_API_KEY") is not None
+newsapi_available = search_engine._get_secret("NEWSAPI_KEY") is not None
 
-status_cols = st.columns(2)
+status_cols = st.columns(3)
 with status_cols[0]:
     if groq_available:
         st.success("✅ Groq AI подключен")
@@ -197,6 +207,11 @@ with status_cols[1]:
         st.success("✅ Brave Search подключен")
     else:
         st.info("ℹ️ Brave не подключен — используется бесплатный DuckDuckGo")
+with status_cols[2]:
+    if newsapi_available:
+        st.success("✅ NewsAPI подключен")
+    else:
+        st.info("ℹ️ NewsAPI не подключен — новости только через DuckDuckGo")
 
 st.divider()
 
