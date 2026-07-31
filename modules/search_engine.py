@@ -32,6 +32,7 @@ except ImportError:
 
 REDDIT_SEARCH_ENDPOINT = "https://www.reddit.com/search.json"
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+NEWSAPI_ENDPOINT = "https://newsapi.org/v2/everything"
 USER_AGENT = "Mozilla/5.0 (compatible; ReputationScanner/1.0; +https://streamlit.app)"
 
 NEGATIVE_KEYWORDS = [
@@ -180,6 +181,88 @@ def search_with_fallback(query: str, count: int = 10) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# NEWSAPI (структурированные новости с точными датами публикации)
+# ---------------------------------------------------------------------------
+
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=1, max=6),
+    retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
+    reraise=True,
+)
+def _newsapi_search_raw(query: str, api_key: str, page_size: int = 15) -> list[dict]:
+    headers = {"X-Api-Key": api_key}
+    params = {
+        "q": query,
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": page_size,
+    }
+
+    with httpx.Client(timeout=10.0) as client:
+        resp = client.get(NEWSAPI_ENDPOINT, headers=headers, params=params)
+        resp.raise_for_status()
+        payload = resp.json()
+
+    if payload.get("status") != "ok":
+        raise RuntimeError(payload.get("message", "NewsAPI вернул ошибку."))
+
+    results = []
+    for article in payload.get("articles", []):
+        results.append({
+            "title": article.get("title", ""),
+            "url": article.get("url", ""),
+            "snippet": article.get("description") or article.get("content", "") or "",
+            "source_name": article.get("source", {}).get("name", ""),
+            "published_at": article.get("publishedAt", ""),  # ISO 8601, напр. "2026-07-15T10:30:00Z"
+        })
+    return results
+
+
+def newsapi_search(company_name: str, extra_terms: str = "lawsuit OR scandal OR fraud OR complaint") -> dict:
+    """
+    Поиск новостных упоминаний через NewsAPI.org. Требует NEWSAPI_KEY в st.secrets.
+    Даёт точные даты публикации (в отличие от DuckDuckGo-сниппетов), что критично
+    для корректного recency decay в scoring.py — свежие негативные новости
+    должны весить заметно больше старых.
+
+    Работает НЕЗАВИСИМО и ПАРАЛЛЕЛЬНО с DuckDuckGo — это не замена, а
+    дополнительный источник: DuckDuckGo покрывает форумы/блоги/отзывы,
+    NewsAPI — только настоящие новостные издания.
+    """
+    api_key = _get_secret("NEWSAPI_KEY")
+
+    if not api_key:
+        return {
+            "status": "failed",
+            "source": "newsapi",
+            "data": [],
+            "error": "NEWSAPI_KEY не задан в st.secrets — новостной поиск через NewsAPI пропущен.",
+        }
+
+    query = f'"{company_name}" {extra_terms}'
+
+    try:
+        results = _newsapi_search_raw(query, api_key)
+        return {"status": "ok", "source": "newsapi", "data": results, "error": None}
+    except Exception as exc:
+        return {"status": "failed", "source": "newsapi", "data": [], "error": str(exc)}
+
+
+def newsapi_days_ago(published_at: str) -> float:
+    """Конвертирует ISO 8601 дату публикации NewsAPI в количество дней назад."""
+    if not published_at:
+        return 365.0
+    try:
+        from datetime import datetime, timezone
+        published = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return max(0.0, (now - published).total_seconds() / 86400.0)
+    except Exception:
+        return 365.0
+
+
+# ---------------------------------------------------------------------------
 # REDDIT (публичный JSON endpoint, без OAuth/ключа)
 # ---------------------------------------------------------------------------
 
@@ -274,9 +357,46 @@ def _extract_rating_from_snippet(snippet: str) -> tuple[float | None, int | None
 
 
 def search_news(company_name: str) -> dict:
-    """Поиск новостных упоминаний (скандалы, судебные иски) — замена GDELT."""
+    """
+    Поиск новостных упоминаний (скандалы, судебные иски) — замена GDELT.
+    Объединяет DuckDuckGo (широкий охват, без ключа) и NewsAPI (точные даты,
+    если NEWSAPI_KEY задан) — это ДВА ПАРАЛЛЕЛЬНЫХ источника, не замена друг друга.
+    """
     query = f'"{company_name}" news lawsuit OR scandal OR investigation'
-    return search_with_fallback(query, count=10)
+    ddg_result = search_with_fallback(query, count=10)
+
+    newsapi_result = newsapi_search(company_name)
+
+    combined_data = list(ddg_result.get("data", []))
+    newsapi_errors = None
+
+    if newsapi_result["status"] == "ok":
+        for article in newsapi_result["data"]:
+            combined_data.append({
+                "title": article["title"],
+                "url": article["url"],
+                "snippet": article["snippet"],
+                "age": "",
+                "source_name": article.get("source_name", ""),
+                "published_at": article.get("published_at", ""),
+            })
+    else:
+        newsapi_errors = newsapi_result["error"]
+
+    if ddg_result["status"] == "failed" and newsapi_result["status"] == "failed":
+        return {
+            "status": "failed",
+            "source": "none",
+            "data": [],
+            "error": f"DuckDuckGo: {ddg_result['error']} | NewsAPI: {newsapi_errors}",
+        }
+
+    return {
+        "status": "ok" if combined_data else "failed",
+        "source": "duckduckgo+newsapi",
+        "data": combined_data,
+        "error": newsapi_errors if newsapi_result["status"] == "failed" else None,
+    }
 
 
 def search_industry_competitors(niche: str, city: str = "", count: int = 8) -> dict:
