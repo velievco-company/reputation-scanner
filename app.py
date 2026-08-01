@@ -121,9 +121,40 @@ def run_analysis(company_name: str, website: str, location: str) -> dict:
         warnings.append(f"Reddit: {reddit_result['error']}")
 
     negative_findings = []
+
+    # --- Негатив с RATING-платформ: низкий рейтинг = сам по себе риск ---
+    # Логика: платформы с числовым рейтингом (Google Maps, Trustpilot, Glassdoor)
+    # дают прямой сигнал негатива через саму оценку, а не через ключевые слова.
+    # Порог 3.0 — общепринятая грань "плохо" независимо от ниши; чем ниже рейтинг,
+    # тем выше severity (используем в штрафе).
+    RATING_NEGATIVE_THRESHOLD = 3.0
+    for rating_entry in company_ratings:
+        rating = rating_entry.get("rating")
+        source = rating_entry.get("source", "unknown")
+        review_count = rating_entry.get("review_count", 0)
+
+        if rating is not None and rating < RATING_NEGATIVE_THRESHOLD:
+            # Чем ниже рейтинг относительно порога, тем серьёзнее находка
+            if rating < 2.0:
+                severity = "high"
+            elif rating < 2.5:
+                severity = "medium"
+            else:
+                severity = "low"
+
+            negative_findings.append({
+                "title": f"Низкий рейтинг на {source}: {rating}/5 ({review_count} отзывов)",
+                "url": "",
+                "days_ago": 30,  # рейтинг - это текущее состояние, считаем актуальным
+                "severity": severity,
+            })
+
+    # --- Негатив с NON-RATING источников (новости, форумы, статьи): по ключевым словам ---
+    # Уже отфильтровано на уровне search_negative_mentions/search_news —
+    # там остаются только результаты с реальным негативным сигналом в тексте.
     for item in negative_search.get("data", []):
         # NewsAPI даёт точную дату публикации -> используем её для recency decay.
-        # DuckDuckGo/Brave не всегда дают точную дату в сниппете -> используем
+        # DuckDuckGo/Bright Data не всегда дают точную дату в сниппете -> используем
         # консервативную оценку 180 дней (среднее между "только что" и "давно").
         published_at = item.get("published_at", "")
         if published_at:
